@@ -77,7 +77,7 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
 
     def forward(self, x, cos_sin, kv_cache):
-        B, T, C = x.size()
+        B, T, C = x.size() # Batch (size) / Text (length) / Char (embedding dimention)
 
         # Project the input to get queries, keys, and values
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
@@ -92,7 +92,7 @@ class CausalSelfAttention(nn.Module):
 
         # Apply KV cache: insert current k,v into cache, get the full view so far
         if kv_cache is not None:
-            k, v = kv_cache.insert_kv(self.layer_idx, k, v)
+            k, v = kv_cache.insert_kv(self.layer_idx, k, v)  # [NOTE] : 每一层都有 cache
         Tq = q.size(2) # number of queries in this forward pass
         Tk = k.size(2) # number of keys/values in total (in the cache + current forward pass)
 
@@ -197,22 +197,23 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=1.0)
 
+    # [NOTE] B, T, H, D   th.outer(arange(T) , arange(R))
     # TODO: bump base theta more, e.g. 100K is more common more recently
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         # autodetect the device from model embeddings
         if device is None:
             device = self.transformer.wte.weight.device
         # stride the channels
-        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
+        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) # [NOTE] ? head_dim/2 → sin + cos
         inv_freq = 1.0 / (base ** (channel_range / head_dim))
         # stride the time steps
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
         # calculate the rotation frequencies at each (time, channel) pair
-        freqs = torch.outer(t, inv_freq)
+        freqs = torch.outer(t, inv_freq) # T, R
         cos, sin = freqs.cos(), freqs.sin()
         cos, sin = cos.bfloat16(), sin.bfloat16() # keep them in bfloat16
         cos, sin = cos[None, :, None, :], sin[None, :, None, :] # add batch and head dims for later broadcasting
-        return cos, sin
+        return cos, sin # B, T, H, D (head_dim/2)
 
     def get_device(self):
         return self.transformer.wte.weight.device
@@ -256,6 +257,7 @@ class GPT(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
+    # [NOTE] loss、cross_entropy 内置到foward里面可选， 也可以外置在train 里面 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
 
@@ -280,8 +282,9 @@ class GPT(nn.Module):
             # training mode: compute and return the loss
             # TODO: experiment with Liger Kernels / chunked cross-entropy etc.
             logits = self.lm_head(x)
-            logits = softcap * torch.tanh(logits / softcap) # logits softcap
+            logits = softcap * torch.tanh(logits / softcap) # logits softcap # softcap 让 tanh( ) 分布更平滑 -softcap ~ + softcap → -1 ~ 1
             logits = logits.float() # use tf32/fp32 for logits
+            # B T K
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             return loss
         else:
@@ -290,6 +293,8 @@ class GPT(nn.Module):
             logits = softcap * torch.tanh(logits / softcap) # logits softcap
             return logits
 
+
+    # 【NOTE】 yield， no break 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
         """
